@@ -1,15 +1,18 @@
 {
-  "name": "baileys",
+  "name": "@wayapiteam/baileys",
   "type": "module",
-  "version": "7.0.0-rc.9",
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "version": "7.0.2",
   "description": "A WebSockets library for interacting with WhatsApp Web",
   "keywords": [
     "whatsapp",
     "automation"
   ],
-  "homepage": "https://github.com/WhiskeySockets/Baileys/",
+  "homepage": "https://github.com/wayapiteam/Baileys/",
   "repository": {
-    "url": "git@github.com:WhiskeySockets/Baileys.git"
+    "url": "git@github.com:wayapiteam/Baileys.git"
   },
   "license": "MIT",
   "author": "Rajeh Taher",
@@ -44,13 +47,13 @@
     "@cacheable/node-cache": "^1.4.0",
     "@hapi/boom": "^9.1.3",
     "async-mutex": "^0.5.0",
-    "libsignal": "git+https://github.com/whiskeysockets/libsignal-node",
+    "libsignal": "https://github.com/whiskeysockets/libsignal-node",
     "lru-cache": "^11.1.0",
-    "music-metadata": "^11.7.0",
+    "music-metadata": "11.12.1",
     "p-queue": "^9.0.0",
     "pino": "^9.6",
     "protobufjs": "^7.2.4",
-    "whatsapp-rust-bridge": "^0.5.0-alpha.1",
+    "whatsapp-rust-bridge": "0.5.3",
     "ws": "^8.13.0"
   },
   "devDependencies": {
