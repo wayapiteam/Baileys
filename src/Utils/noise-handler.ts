@@ -159,7 +159,11 @@ export const makeNoiseHandler = ({
 
 			if (transport) {
 				const result = transport.decrypt(frame)
-				frame = await decodeBinaryNode(result)
+				const decoded = await decodeBinaryNode(result)
+				decoded.telemetry = {
+					wireBytes: size + 3
+				}
+				frame = decoded
 			}
 
 			if (logger.level === 'trace') {

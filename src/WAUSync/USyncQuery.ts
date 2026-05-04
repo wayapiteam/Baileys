@@ -16,6 +16,10 @@ export type USyncQueryResultList = { [protocol: string]: unknown; id: string }
 export type USyncQueryResult = {
 	list: USyncQueryResultList[]
 	sideList: USyncQueryResultList[]
+	telemetry?: {
+		wireBytes?: number
+		wireMb?: number
+	}
 }
 
 export class USyncQuery {

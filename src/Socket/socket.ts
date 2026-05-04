@@ -311,7 +311,14 @@ export const makeSocket = (config: SocketConfig) => {
 		const startedAt = Date.now()
 		const result = await query(iq)
 		const durationMs = Date.now() - startedAt
+		const wireBytes = result?.telemetry?.wireBytes
 		const parsed = usyncQuery.parseUSyncQueryResult(result)
+		if (parsed) {
+			parsed.telemetry = {
+				wireBytes,
+				wireMb: wireBytes === undefined ? undefined : wireBytes / 1024 / 1024
+			}
+		}
 
 		void emitTelemetry(config.telemetry, {
 			stage: 'usync.query',
@@ -334,7 +341,9 @@ export const makeSocket = (config: SocketConfig) => {
 				protocols: protocolNames,
 				iqTag: result?.tag,
 				iqType: result?.attrs?.type,
-				parseSucceeded: !!parsed
+				parseSucceeded: !!parsed,
+				wireBytes,
+				wireMb: wireBytes === undefined ? undefined : wireBytes / 1024 / 1024
 			}
 		})
 
