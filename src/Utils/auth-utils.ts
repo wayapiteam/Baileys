@@ -9,12 +9,14 @@ import type {
 	CacheStore,
 	SignalDataSet,
 	SignalDataTypeMap,
+	SendInstrumentation,
 	SignalKeyStore,
 	SignalKeyStoreWithTransaction,
 	TransactionCapabilityOptions
 } from '../Types'
 import { Curve, signedKeyPair } from './crypto'
 import { delay, generateRegistrationId } from './generics'
+import { emitTelemetry } from './instrumentation'
 import type { ILogger } from './logger'
 import { PreKeyManager } from './pre-key-manager'
 
@@ -115,9 +117,38 @@ export function makeCacheableSignalKeyStore(
 export const addTransactionCapability = (
 	state: SignalKeyStore,
 	logger: ILogger,
-	{ maxCommitRetries, delayBetweenTriesMs }: TransactionCapabilityOptions
+	{ maxCommitRetries, delayBetweenTriesMs }: TransactionCapabilityOptions,
+	telemetry?: SendInstrumentation
 ): SignalKeyStoreWithTransaction => {
 	const txStorage = new AsyncLocalStorage<TransactionContext>()
+
+	const emitSendPathTelemetry = (
+		stage: string,
+		status: 'start' | 'success' | 'hit' | 'miss' | 'failure',
+		counts?: {
+			participants?: number
+			devices?: number
+			sessionsExisting?: number
+			sessionsFetched?: number
+			cacheHits?: number
+			cacheMisses?: number
+			cacheSets?: number
+			attempts?: number
+		},
+		details?: Record<string, unknown>
+	) => {
+		void emitTelemetry(telemetry, {
+			stage,
+			status,
+			counts,
+			details: {
+				namespace: 'send_path',
+				component: 'auth-utils',
+				schemaVersion: 1,
+				...details
+			}
+		})
+	}
 
 	// Queues for concurrency control (keyed by signal data type - bounded set)
 	const keyQueues = new Map<string, PQueue>()
@@ -189,20 +220,48 @@ export const addTransactionCapability = (
 	 */
 	async function commitWithRetry(mutations: SignalDataSet): Promise<void> {
 		if (Object.keys(mutations).length === 0) {
-			logger.trace('no mutations in transaction')
+			emitSendPathTelemetry('keys.transaction.commit', 'hit', undefined, { reason: 'no_mutations' })
 			return
 		}
 
-		logger.trace('committing transaction')
+		const commitStartedAt = Date.now()
+		emitSendPathTelemetry(
+			'keys.transaction.commit',
+			'start',
+			{ cacheSets: Object.values(mutations).reduce((count, value) => count + Object.keys(value || {}).length, 0) },
+			{ types: Object.keys(mutations) }
+		)
 
 		for (let attempt = 0; attempt < maxCommitRetries; attempt++) {
 			try {
+				const attemptStartedAt = Date.now()
 				await state.set(mutations)
-				logger.trace({ mutationCount: Object.keys(mutations).length }, 'committed transaction')
+				emitSendPathTelemetry(
+					'keys.transaction.commit',
+					'success',
+					{
+						cacheSets: Object.values(mutations).reduce((count, value) => count + Object.keys(value || {}).length, 0),
+						attempts: attempt + 1
+					},
+					{
+						mutationCount: Object.keys(mutations).length,
+						durationMs: Date.now() - attemptStartedAt,
+						totalDurationMs: Date.now() - commitStartedAt
+					}
+				)
 				return
 			} catch (error) {
 				const retriesLeft = maxCommitRetries - attempt - 1
-				logger.warn(`failed to commit mutations, retries left=${retriesLeft}`)
+				emitSendPathTelemetry(
+					'keys.transaction.commit',
+					'failure',
+					{ attempts: attempt + 1 },
+					{
+						retriesLeft,
+						totalDurationMs: Date.now() - commitStartedAt,
+						error: error instanceof Error ? error.message : String(error)
+					}
+				)
 
 				if (retriesLeft === 0) {
 					throw error
@@ -228,9 +287,19 @@ export const addTransactionCapability = (
 
 			if (missing.length > 0) {
 				ctx.dbQueries++
-				logger.trace({ type, count: missing.length }, 'fetching missing keys in transaction')
+				const fetchStartedAt = Date.now()
+				emitSendPathTelemetry('keys.transaction.get', 'start', { participants: missing.length }, { type })
 
 				const fetched = await getTxMutex(type).runExclusive(() => state.get(type, missing))
+				emitSendPathTelemetry(
+					'keys.transaction.get',
+					'success',
+					{ participants: missing.length },
+					{
+						type,
+						durationMs: Date.now() - fetchStartedAt
+					}
+				)
 
 				// Update cache
 				ctx.cache[type] = ctx.cache[type] || ({} as any)
@@ -277,7 +346,8 @@ export const addTransactionCapability = (
 			}
 
 			// In transaction - update cache and mutations
-			logger.trace({ types: Object.keys(data) }, 'caching in transaction')
+			const setStartedAt = Date.now()
+			emitSendPathTelemetry('keys.transaction.set', 'start', { cacheSets: Object.keys(data).length }, { types: Object.keys(data) })
 
 			for (const key_ in data) {
 				const key = key_ as keyof SignalDataTypeMap
@@ -295,6 +365,17 @@ export const addTransactionCapability = (
 					Object.assign(ctx.mutations[key]!, data[key])
 				}
 			}
+
+			emitSendPathTelemetry(
+				'keys.transaction.set',
+				'success',
+				{ cacheSets: Object.keys(data).length },
+				{
+					types: Object.keys(data),
+					durationMs: Date.now() - setStartedAt,
+					mutationCount: Object.values(data).reduce((count, value) => count + Object.keys(value || {}).length, 0)
+				}
+			)
 		},
 
 		isInTransaction,
@@ -313,25 +394,45 @@ export const addTransactionCapability = (
 			acquireTxMutexRef(key)
 
 			try {
+				const queuedAt = Date.now()
+				emitSendPathTelemetry('keys.transaction.enter', 'start', undefined, { key })
 				return await mutex.runExclusive(async () => {
+					const waitMs = Date.now() - queuedAt
 					const ctx: TransactionContext = {
 						cache: {},
 						mutations: {},
 						dbQueries: 0
 					}
 
-					logger.trace('entering transaction')
+					emitSendPathTelemetry('keys.transaction.enter', 'success', undefined, { key, waitMs })
 
 					try {
+						const workStartedAt = Date.now()
 						const result = await txStorage.run(ctx, work)
+						emitSendPathTelemetry('keys.transaction.work', 'success', undefined, {
+							key,
+							waitMs,
+							workDurationMs: Date.now() - workStartedAt,
+							dbQueries: ctx.dbQueries
+						})
 
 						// Commit mutations
 						await commitWithRetry(ctx.mutations)
 
-						logger.trace({ dbQueries: ctx.dbQueries }, 'transaction completed')
+						emitSendPathTelemetry('keys.transaction.complete', 'success', undefined, {
+							key,
+							waitMs,
+							dbQueries: ctx.dbQueries
+						})
 
 						return result
 					} catch (error) {
+						emitSendPathTelemetry('keys.transaction.complete', 'failure', undefined, {
+							key,
+							waitMs,
+							dbQueries: ctx.dbQueries,
+							error: error instanceof Error ? error.message : String(error)
+						})
 						logger.error({ error }, 'transaction failed, rolling back')
 						throw error
 					}

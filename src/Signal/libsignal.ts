@@ -3,9 +3,10 @@ import * as libsignal from 'libsignal'
 // @ts-ignore
 import { PreKeyWhisperMessage } from 'libsignal/src/protobufs'
 import { LRUCache } from 'lru-cache'
-import type { LIDMapping, SignalAuthState, SignalKeyStoreWithTransaction } from '../Types'
+import type { LIDMapping, SendInstrumentation, SignalAuthState, SignalKeyStoreWithTransaction } from '../Types'
 import type { SignalRepositoryWithLIDStore } from '../Types/Signal'
 import { generateSignalPubKey } from '../Utils'
+import { emitTelemetry } from '../Utils/instrumentation'
 import type { ILogger } from '../Utils/logger'
 import {
 	isHostedLidUser,
@@ -50,7 +51,8 @@ function extractIdentityFromPkmsg(ciphertext: Uint8Array): Uint8Array | undefine
 export function makeLibSignalRepository(
 	auth: SignalAuthState,
 	logger: ILogger,
-	pnToLIDFunc?: (jids: string[]) => Promise<LIDMapping[] | undefined>
+	pnToLIDFunc?: (jids: string[]) => Promise<LIDMapping[] | undefined>,
+	telemetry?: SendInstrumentation
 ): SignalRepositoryWithLIDStore {
 	const lidMapping = new LIDMappingStore(auth.keys as SignalKeyStoreWithTransaction, logger, pnToLIDFunc)
 	const storage = signalStorage(auth, lidMapping)
@@ -61,6 +63,34 @@ export function makeLibSignalRepository(
 		ttlAutopurge: true,
 		updateAgeOnGet: true
 	})
+
+	const emitSendPathTelemetry = (
+		stage: string,
+		status: 'start' | 'success' | 'hit' | 'miss' | 'failure',
+		counts?: {
+			participants?: number
+			devices?: number
+			sessionsExisting?: number
+			sessionsFetched?: number
+			cacheHits?: number
+			cacheMisses?: number
+			cacheSets?: number
+			attempts?: number
+		},
+		details?: Record<string, unknown>
+	) => {
+		void emitTelemetry(telemetry, {
+			stage,
+			status,
+			counts,
+			details: {
+				namespace: 'send_path',
+				component: 'signal-lib',
+				schemaVersion: 1,
+				...details
+			}
+		})
+	}
 
 	const validateSessions = async (jids: string[]): Promise<Record<string, { exists: boolean; reason?: string }>> => {
 		const uniqueJids = [...new Set(jids)]
@@ -232,11 +262,35 @@ export function makeLibSignalRepository(
 			const cipher = new libsignal.SessionCipher(storage, addr)
 
 			// Use transaction to ensure atomicity
-			return parsedKeys.transaction(async () => {
-				const { type: sigType, body } = await cipher.encrypt(data)
-				const type = sigType === 3 ? 'pkmsg' : 'msg'
-				return { type, ciphertext: Buffer.from(body, 'binary') }
-			}, jid)
+			const startedAt = Date.now()
+			emitSendPathTelemetry('encryptMessage.start', 'start', undefined, { jid })
+			let succeeded = false
+			try {
+				const result = await parsedKeys.transaction(async () => {
+					const encryptStartedAt = Date.now()
+					emitSendPathTelemetry('encryptMessage.cipher.start', 'start', undefined, { jid })
+					const { type: sigType, body } = await cipher.encrypt(data)
+					emitSendPathTelemetry(
+						'encryptMessage.cipher.success',
+						'success',
+						undefined,
+						{
+							jid,
+							durationMs: Date.now() - encryptStartedAt,
+							sigType
+						}
+					)
+					const type: 'pkmsg' | 'msg' = sigType === 3 ? 'pkmsg' : 'msg'
+					return { type, ciphertext: Buffer.from(body, 'binary') }
+				}, jid)
+				succeeded = true
+				return result
+			} finally {
+				emitSendPathTelemetry('encryptMessage.complete', succeeded ? 'success' : 'failure', undefined, {
+					jid,
+					durationMs: Date.now() - startedAt
+				})
+			}
 		},
 
 		async encryptGroupMessage({ group, meId, data, createDistributionMessage = true }) {
