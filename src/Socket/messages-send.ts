@@ -1103,12 +1103,75 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 		emitSendPathTelemetry('createParticipantNodes.encryptRecipients', 'start', {
 			participants: recipientJids.length
 		})
+		type RecipientEncryptSample = {
+			jid: string
+			prepMs: number
+			waitMs: number
+			encryptMs: number
+			totalMs: number
+		}
+		const encryptionProgress = {
+			startedAt: encryptStarted,
+			completed: 0,
+			failed: 0,
+			active: 0,
+			maxWaitMs: 0,
+			maxEncryptMs: 0,
+			maxTotalMs: 0,
+			totalPrepMs: 0,
+			totalWaitMs: 0,
+			totalEncryptMs: 0,
+			slowest: [] as RecipientEncryptSample[]
+		}
+		const keepSlowestSamples = (sample: RecipientEncryptSample) => {
+			encryptionProgress.slowest.push(sample)
+			encryptionProgress.slowest.sort((a, b) => b.totalMs - a.totalMs)
+			if (encryptionProgress.slowest.length > 5) {
+				encryptionProgress.slowest.length = 5
+			}
+		}
+		const emitEncryptionProgress = (status: 'start' | 'success' | 'failure' = 'success') => {
+			const finished = encryptionProgress.completed + encryptionProgress.failed
+			emitSendPathTelemetry(
+				'createParticipantNodes.encryptRecipients.progress',
+				status,
+				{
+					participants: recipientJids.length,
+					devices: encryptionProgress.completed
+				},
+				{
+					durationMs: Date.now() - encryptionProgress.startedAt,
+					completed: encryptionProgress.completed,
+					failed: encryptionProgress.failed,
+					active: encryptionProgress.active,
+					pending:
+						recipientJids.length - encryptionProgress.completed - encryptionProgress.failed - encryptionProgress.active,
+					maxWaitMs: encryptionProgress.maxWaitMs,
+					maxEncryptMs: encryptionProgress.maxEncryptMs,
+					maxTotalMs: encryptionProgress.maxTotalMs,
+					avgPrepMs: finished ? encryptionProgress.totalPrepMs / finished : 0,
+					avgWaitMs: finished ? encryptionProgress.totalWaitMs / finished : 0,
+					avgEncryptMs: finished ? encryptionProgress.totalEncryptMs / finished : 0,
+					slowest: encryptionProgress.slowest.map(sample => ({
+						jid: sample.jid,
+						totalMs: sample.totalMs,
+						waitMs: sample.waitMs,
+						encryptMs: sample.encryptMs
+					}))
+				}
+			)
+		}
+		const progressTimer = setInterval(() => emitEncryptionProgress('start'), 5_000)
+		progressTimer.unref?.()
 		const encryptionPromises = (patchedMessages as any).map(
 			async ({ recipientJid: jid, message: patchedMessage }: any) => {
+				encryptionProgress.active += 1
+				const recipientStartedAt = Date.now()
 				try {
 					if (!jid) return null
 
 					let msgToEncrypt = patchedMessage
+					const prepStartedAt = Date.now()
 
 					if (dsmMessage) {
 						const targetDec = jidDecode(jid)
@@ -1128,6 +1191,8 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 							logger.debug({ jid, targetUser }, 'Using DSM for own device')
 						}
 					}
+					const prepMs = Date.now() - prepStartedAt
+					const waitStartedAt = Date.now()
 
 					const bytes =
 						!Array.isArray(patched) && msgToEncrypt === patched
@@ -1138,7 +1203,26 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					const mutexKey = jid
 
 					const node = await encryptionMutex.mutex(mutexKey, async () => {
+						const waitMs = Date.now() - waitStartedAt
+						const encryptStartedAt = Date.now()
 						const { type, ciphertext } = await signalRepository.encryptMessage({ jid, data: bytes })
+						const encryptMs = Date.now() - encryptStartedAt
+						const totalMs = Date.now() - recipientStartedAt
+
+						encryptionProgress.completed += 1
+						encryptionProgress.totalPrepMs += prepMs
+						encryptionProgress.totalWaitMs += waitMs
+						encryptionProgress.totalEncryptMs += encryptMs
+						encryptionProgress.maxWaitMs = Math.max(encryptionProgress.maxWaitMs, waitMs)
+						encryptionProgress.maxEncryptMs = Math.max(encryptionProgress.maxEncryptMs, encryptMs)
+						encryptionProgress.maxTotalMs = Math.max(encryptionProgress.maxTotalMs, totalMs)
+						keepSlowestSamples({
+							jid,
+							prepMs,
+							waitMs,
+							encryptMs,
+							totalMs
+						})
 
 						if (type === 'pkmsg') {
 							shouldIncludeDeviceIdentity = true
@@ -1160,46 +1244,84 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 
 					return node
 				} catch (err) {
+					encryptionProgress.failed += 1
 					encryptionFailures += 1
 					logger.error({ jid, err }, 'Failed to encrypt for recipient')
 					return null
+				} finally {
+					encryptionProgress.active -= 1
 				}
 			}
 		)
 
-		const nodes = (await Promise.all(encryptionPromises)).filter(node => node !== null) as BinaryNode[]
+		try {
+			const nodes = (await Promise.all(encryptionPromises)).filter(node => node !== null) as BinaryNode[]
 
-		if (recipientJids.length > 0 && nodes.length === 0) {
+			if (recipientJids.length > 0 && nodes.length === 0) {
+				emitSendPathTelemetry(
+					'createParticipantNodes.encryptRecipients',
+					'failure',
+					{ participants: recipientJids.length, devices: 0 },
+					{
+						durationMs: Date.now() - encryptStarted,
+						encryptionFailures,
+						pkmsgCount,
+						maxWaitMs: encryptionProgress.maxWaitMs,
+						maxEncryptMs: encryptionProgress.maxEncryptMs,
+						maxTotalMs: encryptionProgress.maxTotalMs,
+						slowest: encryptionProgress.slowest.map(sample => ({
+							jid: sample.jid,
+							totalMs: sample.totalMs,
+							waitMs: sample.waitMs,
+							encryptMs: sample.encryptMs
+						}))
+					}
+				)
+				throw new Boom('All encryptions failed', { statusCode: 500 })
+			}
+			emitEncryptionProgress('success')
 			emitSendPathTelemetry(
 				'createParticipantNodes.encryptRecipients',
-				'failure',
-				{ participants: recipientJids.length, devices: 0 },
+				'success',
+				{ participants: recipientJids.length, devices: nodes.length },
 				{
 					durationMs: Date.now() - encryptStarted,
 					encryptionFailures,
-					pkmsgCount
+					pkmsgCount,
+					shouldIncludeDeviceIdentity,
+					maxWaitMs: encryptionProgress.maxWaitMs,
+					maxEncryptMs: encryptionProgress.maxEncryptMs,
+					maxTotalMs: encryptionProgress.maxTotalMs,
+					avgPrepMs:
+						encryptionProgress.completed + encryptionProgress.failed
+							? encryptionProgress.totalPrepMs / (encryptionProgress.completed + encryptionProgress.failed)
+							: 0,
+					avgWaitMs:
+						encryptionProgress.completed + encryptionProgress.failed
+							? encryptionProgress.totalWaitMs / (encryptionProgress.completed + encryptionProgress.failed)
+							: 0,
+					avgEncryptMs:
+						encryptionProgress.completed + encryptionProgress.failed
+							? encryptionProgress.totalEncryptMs / (encryptionProgress.completed + encryptionProgress.failed)
+							: 0,
+					slowest: encryptionProgress.slowest.map(sample => ({
+						jid: sample.jid,
+						totalMs: sample.totalMs,
+						waitMs: sample.waitMs,
+						encryptMs: sample.encryptMs
+					}))
 				}
 			)
-			throw new Boom('All encryptions failed', { statusCode: 500 })
+			emitSendPathTelemetry(
+				'createParticipantNodes.complete',
+				'success',
+				{ participants: recipientJids.length, devices: nodes.length },
+				{ durationMs: Date.now() - startedAt, shouldIncludeDeviceIdentity }
+			)
+			return { nodes, shouldIncludeDeviceIdentity }
+		} finally {
+			clearInterval(progressTimer)
 		}
-		emitSendPathTelemetry(
-			'createParticipantNodes.encryptRecipients',
-			'success',
-			{ participants: recipientJids.length, devices: nodes.length },
-			{
-				durationMs: Date.now() - encryptStarted,
-				encryptionFailures,
-				pkmsgCount,
-				shouldIncludeDeviceIdentity
-			}
-		)
-		emitSendPathTelemetry(
-			'createParticipantNodes.complete',
-			'success',
-			{ participants: recipientJids.length, devices: nodes.length },
-			{ durationMs: Date.now() - startedAt, shouldIncludeDeviceIdentity }
-		)
-		return { nodes, shouldIncludeDeviceIdentity }
 	}
 
 	const relayMessage = async (
