@@ -17,10 +17,8 @@ export type USyncQueryResult = {
 	list: USyncQueryResultList[]
 	sideList: USyncQueryResultList[]
 	telemetry?: {
-		resultNodeBytes?: number
-		resultNodeMb?: number
-		resultXmlBytes?: number
-		resultXmlMb?: number
+		wireBytes?: number
+		wireMb?: number
 	}
 }
 

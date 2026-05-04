@@ -311,28 +311,12 @@ export const makeSocket = (config: SocketConfig) => {
 		const startedAt = Date.now()
 		const result = await query(iq)
 		const durationMs = Date.now() - startedAt
-		let resultNodeBytes: number | undefined
-		let resultXmlBytes: number | undefined
-		if (result) {
-			try {
-				resultNodeBytes = encodeBinaryNode(result).byteLength
-			} catch (error) {
-				logger.debug({ error }, 'failed to measure usync binary node size')
-			}
-
-			try {
-				resultXmlBytes = Buffer.byteLength(binaryNodeToString(result), 'utf8')
-			} catch (error) {
-				logger.debug({ error }, 'failed to measure usync xml node size')
-			}
-		}
+		const wireBytes = result?.telemetry?.wireBytes
 		const parsed = usyncQuery.parseUSyncQueryResult(result)
 		if (parsed) {
 			parsed.telemetry = {
-				resultNodeBytes,
-				resultNodeMb: resultNodeBytes === undefined ? undefined : resultNodeBytes / 1024 / 1024,
-				resultXmlBytes,
-				resultXmlMb: resultXmlBytes === undefined ? undefined : resultXmlBytes / 1024 / 1024
+				wireBytes,
+				wireMb: wireBytes === undefined ? undefined : wireBytes / 1024 / 1024
 			}
 		}
 
@@ -358,10 +342,8 @@ export const makeSocket = (config: SocketConfig) => {
 				iqTag: result?.tag,
 				iqType: result?.attrs?.type,
 				parseSucceeded: !!parsed,
-				resultNodeBytes,
-				resultNodeMb: resultNodeBytes === undefined ? undefined : resultNodeBytes / 1024 / 1024,
-				resultXmlBytes,
-				resultXmlMb: resultXmlBytes === undefined ? undefined : resultXmlBytes / 1024 / 1024
+				wireBytes,
+				wireMb: wireBytes === undefined ? undefined : wireBytes / 1024 / 1024
 			}
 		})
 

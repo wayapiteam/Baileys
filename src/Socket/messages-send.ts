@@ -625,10 +625,8 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 			{ participants: toFetch.length },
 			{
 				durationMs: Date.now() - usyncQueryStarted,
-				resultNodeBytes: result?.telemetry?.resultNodeBytes,
-				resultNodeMb: result?.telemetry?.resultNodeMb,
-				resultXmlBytes: result?.telemetry?.resultXmlBytes,
-				resultXmlMb: result?.telemetry?.resultXmlMb
+				wireBytes: result?.telemetry?.wireBytes,
+				wireMb: result?.telemetry?.wireMb
 			}
 		)
 
