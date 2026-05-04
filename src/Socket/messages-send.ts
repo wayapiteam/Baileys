@@ -17,6 +17,7 @@ import type {
 	WarmUpGroupParticipantsSummary,
 	WarmUpGroupSendSummary
 } from '../Types'
+import type { SignalRepository } from '../Types/Signal'
 import { DisconnectReason } from '../Types'
 import type { ILogger } from '../Utils/logger'
 import {
@@ -113,6 +114,18 @@ const withAbort = async <T>(promise: Promise<T>, signal?: AbortSignal): Promise<
 			}
 		)
 	})
+}
+
+export const withScopedSessionCache = async <T>(
+	signalRepository: Pick<SignalRepository, 'withSessionCache'>,
+	recipientJids: string[],
+	work: () => Promise<T>
+): Promise<T> => {
+	if (signalRepository.withSessionCache) {
+		return signalRepository.withSessionCache(recipientJids, work)
+	}
+
+	return work()
 }
 
 type DeviceWithJid = {
@@ -1160,14 +1173,15 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 					}))
 				}
 			)
-		}
-		const progressTimer = setInterval(() => emitEncryptionProgress('start'), 5_000)
-		progressTimer.unref?.()
-		const encryptionPromises = (patchedMessages as any).map(
-			async ({ recipientJid: jid, message: patchedMessage }: any) => {
-				encryptionProgress.active += 1
-				const recipientStartedAt = Date.now()
-				try {
+			}
+			const progressTimer = setInterval(() => emitEncryptionProgress('start'), 5_000)
+			progressTimer.unref?.()
+			const encryptRecipientNodes = async () => {
+				const encryptionPromises = (patchedMessages as any).map(
+					async ({ recipientJid: jid, message: patchedMessage }: any) => {
+					encryptionProgress.active += 1
+					const recipientStartedAt = Date.now()
+					try {
 					if (!jid) return null
 
 					let msgToEncrypt = patchedMessage
@@ -1242,20 +1256,22 @@ export const makeMessagesSocket = (config: SocketConfig) => {
 						}
 					})
 
-					return node
-				} catch (err) {
-					encryptionProgress.failed += 1
-					encryptionFailures += 1
-					logger.error({ jid, err }, 'Failed to encrypt for recipient')
-					return null
-				} finally {
-					encryptionProgress.active -= 1
+						return node
+					} catch (err) {
+						encryptionProgress.failed += 1
+						encryptionFailures += 1
+						logger.error({ jid, err }, 'Failed to encrypt for recipient')
+						return null
+					} finally {
+						encryptionProgress.active -= 1
+					}
 				}
+				)
+				return (await Promise.all(encryptionPromises)).filter(node => node !== null) as BinaryNode[]
 			}
-		)
 
-		try {
-			const nodes = (await Promise.all(encryptionPromises)).filter(node => node !== null) as BinaryNode[]
+			try {
+				const nodes = await withScopedSessionCache(signalRepository, recipientJids, encryptRecipientNodes)
 
 			if (recipientJids.length > 0 && nodes.length === 0) {
 				emitSendPathTelemetry(

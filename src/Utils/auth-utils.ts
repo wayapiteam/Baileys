@@ -285,15 +285,32 @@ export const addTransactionCapability = (
 			const cached = ctx.cache[type] || {}
 			const missing = ids.filter(id => !(id in cached))
 
-			if (missing.length > 0) {
-				ctx.dbQueries++
-				const fetchStartedAt = Date.now()
-				emitSendPathTelemetry('keys.transaction.get', 'start', { participants: missing.length }, { type })
+				if (missing.length > 0) {
+					ctx.dbQueries++
+					const fetchStartedAt = Date.now()
+					emitSendPathTelemetry('keys.transaction.get', 'start', { participants: missing.length }, { type })
 
-				const fetched = await getTxMutex(type).runExclusive(() => state.get(type, missing))
-				emitSendPathTelemetry(
-					'keys.transaction.get',
-					'success',
+					const fetched = await getTxMutex(type).runExclusive(async () => {
+						const waitMs = Date.now() - fetchStartedAt
+						emitSendPathTelemetry('keys.transaction.get.lock', 'success', { participants: missing.length }, { type, waitMs })
+
+						const stateGetStartedAt = Date.now()
+						const result = await state.get(type, missing)
+						emitSendPathTelemetry(
+							'keys.transaction.get.read',
+							'success',
+							{ participants: missing.length },
+							{
+								type,
+								waitMs,
+								durationMs: Date.now() - stateGetStartedAt
+							}
+						)
+						return result
+					})
+					emitSendPathTelemetry(
+						'keys.transaction.get',
+						'success',
 					{ participants: missing.length },
 					{
 						type,
