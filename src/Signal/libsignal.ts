@@ -2,6 +2,7 @@
 import * as libsignal from 'libsignal'
 // @ts-ignore
 import { PreKeyWhisperMessage } from 'libsignal/src/protobufs'
+import { AsyncLocalStorage } from 'async_hooks'
 import { LRUCache } from 'lru-cache'
 import type { LIDMapping, SendInstrumentation, SignalAuthState, SignalKeyStoreWithTransaction } from '../Types'
 import type { SignalRepositoryWithLIDStore } from '../Types/Signal'
@@ -22,6 +23,8 @@ import { SenderKeyName } from './Group/sender-key-name'
 import { SenderKeyRecord } from './Group/sender-key-record'
 import { GroupCipher, GroupSessionBuilder, SenderKeyDistributionMessage } from './Group'
 import { LIDMappingStore } from './lid-mapping'
+
+const sessionCacheStorage = new AsyncLocalStorage<Map<string, Uint8Array>>()
 
 /** Extract identity key from PreKeyWhisperMessage for identity change detection */
 function extractIdentityFromPkmsg(ciphertext: Uint8Array): Uint8Array | undefined {
@@ -55,7 +58,7 @@ export function makeLibSignalRepository(
 	telemetry?: SendInstrumentation
 ): SignalRepositoryWithLIDStore {
 	const lidMapping = new LIDMappingStore(auth.keys as SignalKeyStoreWithTransaction, logger, pnToLIDFunc)
-	const storage = signalStorage(auth, lidMapping)
+	const storage = signalStorage(auth, lidMapping, telemetry)
 
 	const parsedKeys = auth.keys as SignalKeyStoreWithTransaction
 	const migratedSessionCache = new LRUCache<string, true>({
@@ -330,12 +333,13 @@ export function makeLibSignalRepository(
 			return jidToSignalProtocolAddress(jid).toString()
 		},
 
-		// Optimized direct access to LID mapping store
-		lidMapping,
+			// Optimized direct access to LID mapping store
+			lidMapping,
+			withSessionCache,
 
-		async validateSession(jid: string) {
-			return (await validateSessions([jid]))[jid] || { exists: false, reason: 'validation error' }
-		},
+			async validateSession(jid: string) {
+				return (await validateSessions([jid]))[jid] || { exists: false, reason: 'validation error' }
+			},
 		validateSessions,
 
 		async deleteSession(jids: string[]) {
@@ -499,6 +503,76 @@ export function makeLibSignalRepository(
 		}
 	}
 
+	async function withSessionCache<T>(recipientJids: string[], work: () => Promise<T>): Promise<T> {
+		const uniqueJids = [...new Set(recipientJids)]
+		const cache = new Map<string, Uint8Array>()
+
+		return sessionCacheStorage.run(cache, async () => {
+			const preloadStartedAt = Date.now()
+			emitSendPathTelemetry(
+				'encryptMessage.sessionPreload',
+				'start',
+				{ participants: uniqueJids.length },
+				{ path: 'scoped_session_cache' }
+			)
+
+			try {
+				const wireAddresses = new Set<string>()
+				for (const jid of uniqueJids) {
+					try {
+						const signalAddress = jidToSignalProtocolAddress(jid).toString()
+						const wireAddress = await resolveLIDSignalAddress(signalAddress, lidMapping)
+						wireAddresses.add(wireAddress)
+					} catch {
+						// Ignore invalid JIDs during preload and let the regular send path handle them.
+					}
+				}
+
+				let sessionsExisting = 0
+				const wireAddressList = [...wireAddresses]
+				if (wireAddressList.length) {
+					const fetchedSessions = await auth.keys.get('session', wireAddressList)
+					for (const wireAddress of wireAddressList) {
+						const serializedSession = fetchedSessions[wireAddress]
+						if (serializedSession) {
+							cache.set(wireAddress, serializedSession)
+							sessionsExisting += 1
+						}
+					}
+				}
+
+				emitSendPathTelemetry(
+					'encryptMessage.sessionPreload',
+					'success',
+					{
+						participants: uniqueJids.length,
+						sessionsExisting,
+						cacheMisses: Math.max(uniqueJids.length - sessionsExisting, 0)
+					},
+					{
+						durationMs: Date.now() - preloadStartedAt,
+						wireAddresses: [...wireAddresses],
+						path: 'scoped_session_cache'
+					}
+				)
+			} catch (error) {
+				emitSendPathTelemetry(
+					'encryptMessage.sessionPreload',
+					'failure',
+					{ participants: uniqueJids.length },
+					{
+						durationMs: Date.now() - preloadStartedAt,
+						wireAddresses: [],
+						path: 'scoped_session_cache',
+						error: error instanceof Error ? error.message : String(error)
+					}
+				)
+			}
+
+			return await work()
+		})
+	}
+
 	return repository
 }
 
@@ -522,44 +596,90 @@ const jidToSignalProtocolAddress = (jid: string): libsignal.ProtocolAddress => {
 	return new libsignal.ProtocolAddress(signalUser, finalDevice)
 }
 
+const resolveLIDSignalAddress = async (id: string, lidMapping: LIDMappingStore): Promise<string> => {
+	if (id.includes('.')) {
+		const [deviceId, device] = id.split('.')
+		const [user, domainType_] = deviceId!.split('_')
+		const domainType = parseInt(domainType_ || '0')
+
+		if (domainType === WAJIDDomains.LID || domainType === WAJIDDomains.HOSTED_LID) return id
+
+		const pnJid = `${user!}${device !== '0' ? `:${device}` : ''}@${domainType === WAJIDDomains.HOSTED ? 'hosted' : 's.whatsapp.net'}`
+
+		const lidForPN = await lidMapping.getLIDForPN(pnJid)
+		if (lidForPN) {
+			const lidAddr = jidToSignalProtocolAddress(lidForPN)
+			return lidAddr.toString()
+		}
+	}
+
+	return id
+}
+
 const jidToSignalSenderKeyName = (group: string, user: string): SenderKeyName => {
 	return new SenderKeyName(group, jidToSignalProtocolAddress(user))
 }
 
 function signalStorage(
 	{ creds, keys }: SignalAuthState,
-	lidMapping: LIDMappingStore
+	lidMapping: LIDMappingStore,
+	telemetry?: SendInstrumentation
 ): SenderKeyStore &
 	libsignal.SignalStorage & {
 		loadIdentityKey(id: string): Promise<Uint8Array | undefined>
 		saveIdentity(id: string, identityKey: Uint8Array): Promise<boolean>
+		withSessionCache?<T>(jids: string[], work: () => Promise<T>): Promise<T>
 	} {
-	// Shared function to resolve PN signal address to LID if mapping exists
-	const resolveLIDSignalAddress = async (id: string): Promise<string> => {
-		if (id.includes('.')) {
-			const [deviceId, device] = id.split('.')
-			const [user, domainType_] = deviceId!.split('_')
-			const domainType = parseInt(domainType_ || '0')
-
-			if (domainType === WAJIDDomains.LID || domainType === WAJIDDomains.HOSTED_LID) return id
-
-			const pnJid = `${user!}${device !== '0' ? `:${device}` : ''}@${domainType === WAJIDDomains.HOSTED ? 'hosted' : 's.whatsapp.net'}`
-
-			const lidForPN = await lidMapping.getLIDForPN(pnJid)
-			if (lidForPN) {
-				const lidAddr = jidToSignalProtocolAddress(lidForPN)
-				return lidAddr.toString()
+	const emitSendPathTelemetry = (
+		stage: string,
+		status: 'start' | 'success' | 'hit' | 'miss' | 'failure',
+		counts?: {
+			participants?: number
+			devices?: number
+			sessionsExisting?: number
+			sessionsFetched?: number
+			cacheHits?: number
+			cacheMisses?: number
+			cacheSets?: number
+			attempts?: number
+		},
+		details?: Record<string, unknown>
+	) => {
+		void emitTelemetry(telemetry, {
+			stage,
+			status,
+			counts,
+			details: {
+				namespace: 'send_path',
+				component: 'signal-storage',
+				schemaVersion: 1,
+				...details
 			}
-		}
-
-		return id
+		})
 	}
 
 	return {
 		loadSession: async (id: string) => {
 			try {
-				const wireJid = await resolveLIDSignalAddress(id)
+				const loadStartedAt = Date.now()
+				const wireJid = await resolveLIDSignalAddress(id, lidMapping)
+				emitSendPathTelemetry('loadSession.resolveJid', 'success', undefined, {
+					id,
+					wireJid,
+					durationMs: Date.now() - loadStartedAt
+				})
+				const cachedSession = sessionCacheStorage.getStore()?.get(wireJid)
+				if (cachedSession) {
+					return libsignal.SessionRecord.deserialize(cachedSession)
+				}
+				const sessionFetchStartedAt = Date.now()
 				const { [wireJid]: sess } = await keys.get('session', [wireJid])
+				emitSendPathTelemetry('loadSession.sessionFetch', 'success', undefined, {
+					id,
+					wireJid,
+					durationMs: Date.now() - sessionFetchStartedAt,
+					hasSession: !!sess
+				})
 
 				if (sess) {
 					return libsignal.SessionRecord.deserialize(sess)
@@ -571,19 +691,19 @@ function signalStorage(
 			return null
 		},
 		storeSession: async (id: string, session: libsignal.SessionRecord) => {
-			const wireJid = await resolveLIDSignalAddress(id)
+			const wireJid = await resolveLIDSignalAddress(id, lidMapping)
 			await keys.set({ session: { [wireJid]: session.serialize() } })
 		},
 		isTrustedIdentity: () => {
 			return true // TOFU - Trust on First Use (same as WhatsApp Web)
 		},
 		loadIdentityKey: async (id: string) => {
-			const wireJid = await resolveLIDSignalAddress(id)
+			const wireJid = await resolveLIDSignalAddress(id, lidMapping)
 			const { [wireJid]: key } = await keys.get('identity-key', [wireJid])
 			return key || undefined
 		},
 		saveIdentity: async (id: string, identityKey: Uint8Array): Promise<boolean> => {
-			const wireJid = await resolveLIDSignalAddress(id)
+			const wireJid = await resolveLIDSignalAddress(id, lidMapping)
 			const { [wireJid]: existingKey } = await keys.get('identity-key', [wireJid])
 
 			const keysMatch =
@@ -626,27 +746,27 @@ function signalStorage(
 				pubKey: Buffer.from(key.keyPair.public)
 			}
 		},
-		loadSenderKey: async (senderKeyName: SenderKeyName) => {
-			const keyId = senderKeyName.toString()
-			const { [keyId]: key } = await keys.get('sender-key', [keyId])
-			if (key) {
-				return SenderKeyRecord.deserialize(key)
-			}
+			loadSenderKey: async (senderKeyName: SenderKeyName) => {
+				const keyId = senderKeyName.toString()
+				const { [keyId]: key } = await keys.get('sender-key', [keyId])
+				if (key) {
+					return SenderKeyRecord.deserialize(key)
+				}
 
-			return new SenderKeyRecord()
-		},
-		storeSenderKey: async (senderKeyName: SenderKeyName, key: SenderKeyRecord) => {
-			const keyId = senderKeyName.toString()
-			const serialized = JSON.stringify(key.serialize())
-			await keys.set({ 'sender-key': { [keyId]: Buffer.from(serialized, 'utf-8') } })
-		},
-		getOurRegistrationId: () => creds.registrationId,
-		getOurIdentity: () => {
-			const { signedIdentityKey } = creds
-			return {
-				privKey: Buffer.from(signedIdentityKey.private),
-				pubKey: Buffer.from(generateSignalPubKey(signedIdentityKey.public))
+				return new SenderKeyRecord()
+			},
+			storeSenderKey: async (senderKeyName: SenderKeyName, key: SenderKeyRecord) => {
+				const keyId = senderKeyName.toString()
+				const serialized = JSON.stringify(key.serialize())
+				await keys.set({ 'sender-key': { [keyId]: Buffer.from(serialized, 'utf-8') } })
+			},
+			getOurRegistrationId: () => creds.registrationId,
+			getOurIdentity: () => {
+				const { signedIdentityKey } = creds
+				return {
+					privKey: Buffer.from(signedIdentityKey.private),
+					pubKey: Buffer.from(generateSignalPubKey(signedIdentityKey.public))
+				}
 			}
 		}
 	}
-}

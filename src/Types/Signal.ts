@@ -69,6 +69,7 @@ export type SignalRepository = {
 	jidToSignalProtocolAddress(jid: string): string
 	migrateSession(fromJid: string, toJid: string): Promise<{ migrated: number; skipped: number; total: number }>
 	deleteSession(jids: string[]): Promise<void>
+	withSessionCache?<T>(jids: string[], work: () => Promise<T>): Promise<T>
 }
 
 // Optimized repository with pre-loaded LID mapping store
