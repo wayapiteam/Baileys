@@ -50,7 +50,7 @@ import {
 	xmppPreKey,
 	xmppSignedPreKey
 } from '../Utils'
-import { makeMutex } from '../Utils/make-mutex'
+import { makeKeyedMutex, makeMutex } from '../Utils/make-mutex'
 import { makeOfflineNodeProcessor, type MessageType } from '../Utils/offline-node-processor'
 import { buildAckStanza } from '../Utils/stanza-ack'
 import {
@@ -112,7 +112,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 	const getLIDForPN = signalRepository.lidMapping.getLIDForPN.bind(signalRepository.lidMapping)
 
 	/** this mutex ensures that each retryRequest will wait for the previous one to finish */
-	const retryMutex = makeMutex()
+	const retryMutex = makeKeyedMutex()
 
 	const msgRetryCache =
 		config.msgRetryCounterCache ||
@@ -1143,7 +1143,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 		try {
 			await Promise.all([
-				receiptMutex.mutex(async () => {
+				receiptMutex.mutex(remoteJid!, async () => {
 					const status = getStatusFromReceiptType(attrs.type)
 					if (
 						typeof status !== 'undefined' &&
@@ -1212,7 +1212,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 
 		try {
 			await Promise.all([
-				notificationMutex.mutex(async () => {
+				notificationMutex.mutex(remoteJid!, async () => {
 					const msg = await processNotification(node)
 					if (msg) {
 						const fromMe = areJidsSameUser(node.attrs.participant || remoteJid, authState.creds.me!.id)
@@ -1275,11 +1275,14 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 				}
 			}
 
-			await messageMutex.mutex(async () => {
+			const remoteJid = msg.key.remoteJid!;  
+			const msgId = msg.key.id!;
+
+			await messageMutex.mutex(remoteJid!, async () => {
 				await decrypt()
 
-				if (msg.key?.remoteJid && msg.key?.id && msg.message && messageRetryManager) {
-					messageRetryManager.addRecentMessage(msg.key.remoteJid, msg.key.id, msg.message)
+				if (remoteJid && msgId && msg.message && messageRetryManager) {
+					messageRetryManager.addRecentMessage(remoteJid, msgId, msg.message)
 				}
 
 				// message failed to decrypt
@@ -1371,7 +1374,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 						logger.debug(`[handleMessage] Attempting retry request for failed decryption`)
 
 						// Handle both pre-key and normal retries in single mutex
-						await retryMutex.mutex(async () => {
+						await retryMutex.mutex(remoteJid, async () => {
 							try {
 								if (!ws.isOpen) {
 									logger.debug({ node }, 'Connection closed, skipping retry')
